@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Remote Desktop - Controller</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background-color: #f0f0f0;
+            overflow: hidden;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        #sessionList {
+            margin-bottom: 20px;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+        }
+        .session-item {
+            padding: 10px;
+            margin: 5px 0;
+            background-color: #fff;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .session-item:hover {
+            background-color: #f5f5f5;
+        }
+        .join-button {
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: background-color 0.2s;
+        }
+        .join-button:hover {
+            background-color: #45a049;
+        }
+        #screenContainer {
+            position: relative;
+            width: 100%;
+            height: calc(100vh - 200px);
+            display: none;
+        }
+        #screen {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            background-color: #000;
+        }
+        #controls {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            z-index: 1000;
+            background-color: rgba(0, 0, 0, 0.7);
+            padding: 10px;
+            border-radius: 4px;
+            display: none;
+            color: white;
+        }
+        #controls button {
+            background-color: #fff;
+            border: none;
+            padding: 5px 10px;
+            margin: 0 5px;
+            border-radius: 3px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        #controls button:hover {
+            background-color: #eee;
+        }
+        #controls button.active {
+            background-color: #4CAF50;
+            color: white;
+        }
+        #quality-controls {
+            display: flex;
+            align-items: center;
+            margin-top: 5px;
+        }
+        #quality-controls button {
+            padding: 3px 8px;
+            font-size: 12px;
+        }
+        #quality-label {
+            margin-right: 10px;
+            font-size: 12px;
+        }
+        .fullscreen {
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            z-index: 9999 !important;
+        }
+        .status {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 4px;
+            text-align: center;
+        }
+        .error {
+            background-color: #ffebee;
+            color: #c62828;
+        }
+        .success {
+            background-color: #e8f5e9;
+            color: #2e7d32;
+        }
+        #performance {
+            position: fixed;
+            bottom: 10px;
+            left: 10px;
+            background-color: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Remote Desktop Controller</h1>
+        <div id="status" class="status">Connecting to server...</div>
+        <div id="latency"></div>
+        <div id="sessionList"></div>
+        <div id="screenContainer">
+            <canvas id="screen"></canvas>
+            <div id="controls">
+                <button id="fullscreen-btn" title="Toggle Fullscreen">
+                    <span class="fullscreen-icon">⛶</span>
+                </button>
+                <div id="quality-controls">
+                    <span id="quality-label">Quality:</span>
+                    <button class="quality-btn" data-quality="1">Low</button>
+                    <button class="quality-btn" data-quality="2">Medium</button>
+                    <button class="quality-btn" data-quality="3">High</button>
+                    <button class="quality-btn active" data-quality="4">Best</button>
+                </div>
+            </div>
+            <div id="performance">
+                FPS: <span id="fps-counter">0</span> | 
+                Bandwidth: <span id="bandwidth-counter">0</span> Mbps
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Global variables
+        let socket = null;
+        let currentSessionId = null;
+        let screenContainer = null;
+        let screen = null;
+        let controls = null;
+        let isFullscreen = false;
+        let currentQuality = 4;
+        let frameRequestPending = false;
+        let nextFrameRequest = null;
+        let lastFrameTime = performance.now();
+        let frameCount = 0;
+        let fps = 0;
+        let totalBytesReceived = 0;
+        let lastPingTime = 0;
+        const FRAME_INTERVAL = 1000 / 30; // Target 30 FPS
+
+        // Initialize canvas with default size
+        const canvas = document.getElementById('screen');
+        canvas.width = 1920;
+        canvas.height = 1080;
+        const ctx = canvas.getContext('2d', {
+            alpha: false,
+            desynchronized: true
+        });
+        
+        // Clear canvas with black background
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // Function to request next frame
+        function requestNextFrame() {
+            if (!currentSessionId || frameRequestPending) return;
+            
+            frameRequestPending = true;
+            
+            if (nextFrameRequest) {
+                clearTimeout(nextFrameRequest);
+            }
+            
+            socket.emit('request_frame', { 
+                session_id: currentSessionId 
+            });
+            
+            nextFrameRequest = setTimeout(() => {
+                frameRequestPending = false;
+                requestNextFrame();
+            }, FRAME_INTERVAL);
+        }
+
+        // Function to format bandwidth
+        function formatBandwidth(bytes) {
+            const mbps = (bytes * 8) / (1024 * 1024);  // Convert to Mbps
+            return mbps.toFixed(2);
+        }
+
+        // Function to update stats display
+        function updateStats() {
+            document.getElementById('fps-counter').textContent = fps;
+            const bandwidthMBps = formatBandwidth(totalBytesReceived);
+            document.getElementById('bandwidth-counter').textContent = bandwidthMBps;
+            
+            // Reset bandwidth counter
+            totalBytesReceived = 0;
+        }
+
+        // Function to update screen with new frame
+        function updateScreen(imageData) {
+            const now = performance.now();
+            const timeDiff = now - lastFrameTime;
+            
+            // Update bandwidth calculation
+            totalBytesReceived += (imageData.length * 3) / 4; // Base64 to binary size
+            
+            if (timeDiff >= 1000) {
+                fps = Math.round((frameCount * 1000) / timeDiff);
+                frameCount = 0;
+                lastFrameTime = now;
+                
+                // Update stats display
+                updateStats();
+            }
+            
+            frameCount++;
+            
+            // Create new image
+            const img = new Image();
+            img.onload = () => {
+                // Draw to canvas
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                
+                // Request next frame
+                frameRequestPending = false;
+                requestNextFrame();
+            };
+            img.src = 'data:image/jpeg;base64,' + imageData;
+        }
+
+        // Initialize WebSocket connection
+        async function initializeSocket() {
+            try {
+                const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${wsProtocol}//${window.location.host}`;
+                
+                if (socket) {
+                    socket.close();
+                }
+
+                socket = io({
+                    reconnection: true,
+                    reconnectionAttempts: 10,
+                    reconnectionDelay: 1000,
+                    reconnectionDelayMax: 5000,
+                    timeout: 60000,
+                    autoConnect: true,
+                    transports: ['websocket']
+                });
+
+                socket.on('connect', () => {
+                    console.log('Connected to server');
+                    document.getElementById('status').textContent = 'Connected to server';
+                    document.getElementById('status').className = 'success';
+                    // Request sessions list after connecting
+                    socket.emit('session_request');
+                    measureLatency();
+                });
+
+                socket.on('disconnect', () => {
+                    console.log('Disconnected from server');
+                    document.getElementById('status').textContent = 'Disconnected from server';
+                    document.getElementById('status').className = 'error';
+                    currentSessionId = null;
+                    hideScreen();
+                });
+
+                socket.on('connect_error', (error) => {
+                    console.error('Connection error:', error);
+                    document.getElementById('status').textContent = 'Connection error: ' + error;
+                    document.getElementById('status').className = 'error';
+                    hideScreen();
+                    currentSessionId = null;
+                });
+
+                socket.on('reconnect', (attemptNumber) => {
+                    console.log('Reconnected after', attemptNumber, 'attempts');
+                    document.getElementById('status').textContent = 'Reconnected to server';
+                    document.getElementById('status').className = 'success';
+                    // Request session list
+                    socket.emit('session_request');
+                });
+
+                socket.on('reconnect_attempt', (attemptNumber) => {
+                    console.log('Attempting to reconnect:', attemptNumber);
+                    document.getElementById('status').textContent = 'Reconnecting... (attempt ' + attemptNumber + ')';
+                    document.getElementById('status').className = 'warning';
+                });
+
+                socket.on('reconnect_error', (error) => {
+                    console.error('Reconnection error:', error);
+                    document.getElementById('status').textContent = 'Reconnection error: ' + error;
+                    document.getElementById('status').className = 'error';
+                });
+
+                socket.on('reconnect_failed', () => {
+                    console.error('Failed to reconnect');
+                    document.getElementById('status').textContent = 'Failed to reconnect';
+                    document.getElementById('status').className = 'error';
+                });
+
+                socket.on('connection_info', (data) => {
+                    console.log('Connection info:', data);
+                    if (data.session_id) {
+                        currentSessionId = data.session_id;
+                    }
+                });
+
+                socket.on('error', (data) => {
+                    console.error('Server error:', data.message);
+                    document.getElementById('status').className = 'error';
+                    document.getElementById('status').textContent = 'Error: ' + data.message;
+                    if (currentSessionId) {
+                        hideScreen();
+                        currentSessionId = null;
+                    }
+                });
+
+                socket.on('sessions_list', (sessions) => {
+                    console.log('Received sessions:', sessions);
+                    if (sessions && sessions.length > 0) {
+                        updateSessionList(sessions);
+                        document.getElementById('status').textContent = 'Sessions available';
+                    } else {
+                        document.getElementById('status').textContent = 'No active sessions';
+                    }
+                });
+
+                socket.on('frame', (data) => {
+                    if (data && data.image) {
+                        updateScreen(data.image);
+                        document.getElementById('status').textContent = 'Receiving screen updates';
+                        document.getElementById('status').className = 'success';
+                        document.getElementById('performance').style.display = 'block';
+                    }
+                });
+
+                socket.on('joined_session', (data) => {
+                    if (data && data.session_id) {
+                        currentSessionId = data.session_id;
+                        showScreen();
+                        console.log(`Joined session: ${currentSessionId}`);
+                        document.getElementById('status').textContent = 'Connected to session';
+                        document.getElementById('status').className = 'success';
+                        // Start requesting frames
+                        frameRequestPending = false;
+                        requestNextFrame();
+                    } else {
+                        console.error('Invalid joined_session data');
+                        document.getElementById('status').className = 'error';
+                        document.getElementById('status').textContent = 'Failed to join session';
+                    }
+                });
+
+                socket.on('left_session', () => {
+                    console.log('Left session');
+                    currentSessionId = null;
+                    hideScreen();
+                    document.getElementById('status').textContent = 'Disconnected from session';
+                    document.getElementById('status').className = 'error';
+                });
+
+                socket.on('pong', () => {
+                    const latency = Date.now() - lastPingTime;
+                    document.getElementById('latency').textContent = `Latency: ${latency}ms`;
+                });
+
+                // Start latency measurement
+                setInterval(measureLatency, 2000);
+
+            } catch (error) {
+                console.error('Socket initialization error:', error);
+                document.getElementById('status').className = 'error';
+                document.getElementById('status').textContent = 'Socket initialization error: ' + error.message;
+            }
+        }
+
+        function measureLatency() {
+            if (socket && socket.connected) {
+                lastPingTime = Date.now();
+                socket.emit('ping');
+            }
+        }
+
+        function setQuality(quality) {
+            if (!currentSessionId) return;
+            
+            currentQuality = quality;
+            socket.emit('set_quality', {
+                session_id: currentSessionId,
+                quality: quality
+            });
+            
+            // Update UI
+            document.querySelectorAll('.quality-btn').forEach(btn => {
+                btn.classList.remove('active');
+                if (parseInt(btn.dataset.quality) === quality) {
+                    btn.classList.add('active');
+                }
+            });
+        }
+
+        function updateSessionList(sessions) {
+            const sessionList = document.getElementById('sessionList');
+            sessionList.innerHTML = '<h3>Available Sessions</h3>';
+            
+            if (!sessions || sessions.length === 0) {
+                sessionList.innerHTML += '<p>No active sessions</p>';
+                return;
+            }
+
+            sessions.forEach(session => {
+                const sessionItem = document.createElement('div');
+                sessionItem.className = 'session-item';
+                
+                const sessionInfo = document.createElement('span');
+                sessionInfo.textContent = `${session.client_name}'s Screen`;
+                sessionItem.appendChild(sessionInfo);
+                
+                const joinButton = document.createElement('button');
+                joinButton.className = 'join-button';
+                joinButton.textContent = 'Join Session';
+                joinButton.onclick = (e) => {
+                    e.stopPropagation();  // Prevent event bubbling
+                    joinSession(session.id);
+                };
+                sessionItem.appendChild(joinButton);
+                
+                sessionList.appendChild(sessionItem);
+            });
+        }
+
+        function joinSession(sessionId) {
+            if (!socket || !socket.connected) {
+                document.getElementById('status').textContent = 'Not connected to server';
+                document.getElementById('status').className = 'error';
+                return;
+            }
+            
+            document.getElementById('status').textContent = 'Joining session...';
+            currentSessionId = sessionId;
+            socket.emit('join_session', { session_id: sessionId });
+        }
+
+        function showScreen() {
+            screenContainer = document.getElementById('screenContainer');
+            screen = document.getElementById('screen');
+            controls = document.getElementById('controls');
+            
+            screenContainer.style.display = 'block';
+            controls.style.display = 'block';
+            document.getElementById('sessionList').style.display = 'none';
+            document.getElementById('performance').style.display = 'block';
+            
+            setupScreenControls();
+            
+            // Start requesting frames
+            frameRequestPending = false;
+            requestNextFrame();
+        }
+
+        function hideScreen() {
+            if (screenContainer) {
+                screenContainer.style.display = 'none';
+            }
+            if (controls) {
+                controls.style.display = 'none';
+            }
+            document.getElementById('sessionList').style.display = 'block';
+            document.getElementById('performance').style.display = 'none';
+            
+            removeScreenControls();
+            
+            // Stop requesting frames
+            if (nextFrameRequest) {
+                clearTimeout(nextFrameRequest);
+                nextFrameRequest = null;
+            }
+            frameRequestPending = false;
+        }
+
+        function setupScreenControls() {
+            const screen = document.getElementById('screen');
+            
+            // Add event listeners for mouse/keyboard events
+            screen.addEventListener('mousemove', handleMouseMove);
+            screen.addEventListener('mousedown', handleMouseDown);
+            screen.addEventListener('mouseup', handleMouseUp);
+            screen.addEventListener('wheel', handleWheel);
+            screen.addEventListener('contextmenu', e => e.preventDefault());
+            document.addEventListener('keydown', handleKeyDown);
+            document.addEventListener('keyup', handleKeyUp);
+            
+            // Set up quality control buttons
+            document.querySelectorAll('.quality-btn').forEach(btn => {
+                btn.onclick = () => setQuality(parseInt(btn.dataset.quality));
+            });
+            
+            // Set up fullscreen button
+            document.getElementById('fullscreen-btn').onclick = toggleFullscreen;
+            
+            // Initialize with high quality
+            setQuality(4);
+        }
+
+        function removeScreenControls() {
+            const screen = document.getElementById('screen');
+            
+            // Remove event listeners
+            screen.removeEventListener('mousemove', handleMouseMove);
+            screen.removeEventListener('mousedown', handleMouseDown);
+            screen.removeEventListener('mouseup', handleMouseUp);
+            screen.removeEventListener('wheel', handleWheel);
+            screen.removeEventListener('contextmenu', e => e.preventDefault());
+            document.removeEventListener('keydown', handleKeyDown);
+            document.removeEventListener('keyup', handleKeyUp);
+        }
+
+        function handleKeyDown(e) {
+            if (!currentSessionId) return;
+            
+            // Prevent default actions for all keys
+            e.preventDefault();
+            
+            socket.emit('keyboard_event', {
+                session_id: currentSessionId,
+                type: 'keydown',
+                key: e.key,
+                code: e.code,
+                altKey: e.altKey,
+                ctrlKey: e.ctrlKey,
+                shiftKey: e.shiftKey,
+                metaKey: e.metaKey
+            });
+        }
+
+        function handleKeyUp(e) {
+            if (!currentSessionId) return;
+            
+            // Prevent default actions for all keys
+            e.preventDefault();
+            
+            socket.emit('keyboard_event', {
+                session_id: currentSessionId,
+                type: 'keyup',
+                key: e.key,
+                code: e.code,
+                altKey: e.altKey,
+                ctrlKey: e.ctrlKey,
+                shiftKey: e.shiftKey,
+                metaKey: e.metaKey
+            });
+        }
+
+        function handleMouseMove(e) {
+            if (!currentSessionId) return;
+            
+            const rect = e.target.getBoundingClientRect();
+            const x = (e.clientX - rect.left) / rect.width;
+            const y = (e.clientY - rect.top) / rect.height;
+            
+            socket.emit('mouse_event', {
+                session_id: currentSessionId,
+                type: 'mousemove',
+                x: x,
+                y: y
+            });
+        }
+
+        function handleMouseDown(e) {
+            if (!currentSessionId) return;
+            
+            e.preventDefault();
+            
+            const rect = e.target.getBoundingClientRect();
+            const x = (e.clientX - rect.left) / rect.width;
+            const y = (e.clientY - rect.top) / rect.height;
+            
+            socket.emit('mouse_event', {
+                session_id: currentSessionId,
+                type: 'mousedown',
+                button: e.button,
+                x: x,
+                y: y
+            });
+        }
+
+        function handleMouseUp(e) {
+            if (!currentSessionId) return;
+            
+            e.preventDefault();
+            
+            const rect = e.target.getBoundingClientRect();
+            const x = (e.clientX - rect.left) / rect.width;
+            const y = (e.clientY - rect.top) / rect.height;
+            
+            socket.emit('mouse_event', {
+                session_id: currentSessionId,
+                type: 'mouseup',
+                button: e.button,
+                x: x,
+                y: y
+            });
+        }
+
+        function handleWheel(e) {
+            if (!currentSessionId) return;
+            
+            e.preventDefault();
+            
+            socket.emit('mouse_event', {
+                session_id: currentSessionId,
+                type: 'wheel',
+                deltaX: e.deltaX,
+                deltaY: e.deltaY,
+                deltaMode: e.deltaMode
+            });
+        }
+
+        function toggleFullscreen() {
+            const screenContainer = document.getElementById('screenContainer');
+            
+            if (!isFullscreen) {
+                screenContainer.classList.add('fullscreen');
+                if (screenContainer.requestFullscreen) {
+                    screenContainer.requestFullscreen();
+                }
+            } else {
+                screenContainer.classList.remove('fullscreen');
+                if (document.exitFullscreen) {
+                    document.exitFullscreen();
+                }
+            }
+            
+            isFullscreen = !isFullscreen;
+        }
+
+        // Initialize when page loads
+        document.addEventListener('DOMContentLoaded', () => {
+            initializeSocket();
+        });
+    </script>
+</body>
+</html>

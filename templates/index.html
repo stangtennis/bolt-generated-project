@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Remote Desktop - Screen Share</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background-color: #f0f0f0;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #666;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            width: 100%;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        #status {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 4px;
+            text-align: center;
+        }
+        .success {
+            background-color: #dff0d8;
+            color: #3c763d;
+        }
+        .error {
+            background-color: #f2dede;
+            color: #a94442;
+        }
+        #connectionInfo {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+        }
+        .connection-details {
+            font-family: monospace;
+            margin: 5px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Remote Desktop - Screen Share</h1>
+        <div class="form-group">
+            <label for="name">Your Name:</label>
+            <input type="text" id="name" placeholder="Enter your name">
+        </div>
+        <button id="startShare">Start Screen Sharing</button>
+        <button id="stopShare" style="display: none;">Stop Screen Sharing</button>
+        <div id="status"></div>
+        <div id="connectionInfo" style="display: none;">
+            <h3>Connection Information</h3>
+            <div class="connection-details" id="publicIp"></div>
+            <div class="connection-details" id="localIp"></div>
+            <div class="connection-details" id="sessionId"></div>
+        </div>
+    </div>
+
+    <script>
+        let socket;
+        let mediaStream;
+        let sessionId;
+        let peerConnections = {};
+        let stunServers;
+        let turnServer;
+
+        // Get connection info including STUN/TURN servers
+        async function getConnectionInfo() {
+            try {
+                const response = await fetch('/connection-info');
+                const data = await response.json();
+                stunServers = data.stunServers;
+                turnServer = data.turnServer;
+                
+                document.getElementById('publicIp').textContent = `Public IP: ${data.publicIp}`;
+                document.getElementById('localIp').textContent = `Local IP: ${data.localIp}`;
+                document.getElementById('connectionInfo').style.display = 'block';
+            } catch (error) {
+                console.error('Error getting connection info:', error);
+            }
+        }
+
+        // Initialize WebSocket connection
+        function initializeSocket() {
+            // Get STUN/TURN configuration
+            fetch('/connection-info')
+                .then(response => response.json())
+                .then(config => {
+                    // Always use secure WebSocket when available
+                    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    const wsUrl = `${protocol}//${window.location.host}`;
+                    
+                    socket = io(wsUrl, {
+                        transports: ['websocket'],
+                        upgrade: false,
+                        reconnection: true,
+                        reconnectionAttempts: 5,
+                        reconnectionDelay: 1000,
+                        reconnectionDelayMax: 5000,
+                        secure: true,
+                        rejectUnauthorized: false,
+                        iceServers: config.iceServers
+                    });
+
+                    socket.on('connect', () => {
+                        console.log('Connected to server');
+                        document.getElementById('status').className = 'success';
+                        document.getElementById('status').textContent = 'Connected to server';
+                    });
+
+                    socket.on('disconnect', () => {
+                        console.log('Disconnected from server');
+                        document.getElementById('status').className = 'error';
+                        document.getElementById('status').textContent = 'Disconnected from server';
+                        stopScreenShare();
+                        // Try to reconnect after a delay
+                        setTimeout(initializeSocket, 5000);
+                    });
+
+                    socket.on('error', (data) => {
+                        console.error('Server error:', data.message);
+                        document.getElementById('status').className = 'error';
+                        document.getElementById('status').textContent = `Error: ${data.message}`;
+                    });
+
+                    // Start latency monitoring
+                    setInterval(measureLatency, 2000);
+                })
+                .catch(error => {
+                    console.error('Failed to get connection info:', error);
+                    document.getElementById('status').className = 'error';
+                    document.getElementById('status').textContent = 'Failed to initialize connection';
+                });
+        }
+
+        // Start screen sharing
+        async function startScreenShare() {
+            try {
+                const name = document.getElementById('name').value.trim();
+                if (!name) {
+                    alert('Please enter your name first');
+                    return;
+                }
+
+                // Create session first
+                socket.emit('create_session', { client_name: name });
+
+                // Wait for session creation confirmation
+                await new Promise((resolve, reject) => {
+                    socket.once('session_created', (data) => {
+                        sessionId = data.session_id;
+                        resolve();
+                    });
+                    socket.once('error', (error) => {
+                        reject(new Error(error.message));
+                    });
+                    // Timeout after 5 seconds
+                    setTimeout(() => reject(new Error('Session creation timeout')), 5000);
+                });
+
+                // Request screen sharing
+                mediaStream = await navigator.mediaDevices.getDisplayMedia({
+                    video: {
+                        cursor: "always",
+                        frameRate: { ideal: 30, max: 60 },
+                    },
+                    audio: false
+                });
+
+                const videoTrack = mediaStream.getVideoTracks()[0];
+                
+                // Create canvas for capturing frames
+                const canvas = document.createElement('canvas');
+                const context = canvas.getContext('2d');
+                const video = document.createElement('video');
+                video.srcObject = mediaStream;
+                await video.play();
+
+                // Set initial canvas size
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+
+                // Handle screen sharing stop
+                videoTrack.onended = () => {
+                    stopScreenShare();
+                };
+
+                let lastFrameTime = 0;
+                const frameInterval = 1000 / 30; // Target 30 FPS
+
+                // Send frames to server
+                async function sendFrame(timestamp) {
+                    if (!mediaStream.active) return;
+
+                    // Throttle frame rate
+                    if (timestamp - lastFrameTime < frameInterval) {
+                        requestAnimationFrame(sendFrame);
+                        return;
+                    }
+
+                    try {
+                        // Update canvas size if video dimensions change
+                        if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+                            canvas.width = video.videoWidth;
+                            canvas.height = video.videoHeight;
+                        }
+
+                        // Draw frame to canvas
+                        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+                        
+                        // Compress and send frame
+                        const imageData = canvas.toDataURL('image/jpeg', 0.7);
+                        socket.emit('screen_data', {
+                            session_id: sessionId,
+                            image: imageData,
+                            timestamp: Date.now()
+                        });
+
+                        lastFrameTime = timestamp;
+                    } catch (error) {
+                        console.error('Error sending frame:', error);
+                    }
+
+                    requestAnimationFrame(sendFrame);
+                }
+
+                // Start sending frames
+                requestAnimationFrame(sendFrame);
+
+                // Update UI
+                document.getElementById('startShare').style.display = 'none';
+                document.getElementById('stopShare').style.display = 'block';
+                document.getElementById('status').textContent = 'Screen sharing started. Session ID: ' + sessionId;
+
+            } catch (error) {
+                console.error('Error starting screen share:', error);
+                document.getElementById('status').className = 'error';
+                document.getElementById('status').textContent = `Error starting screen share: ${error.message}`;
+                stopScreenShare();
+            }
+        }
+
+        // Stop screen sharing
+        function stopScreenShare() {
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+                mediaStream = null;
+            }
+            document.getElementById('startShare').style.display = 'block';
+            document.getElementById('stopShare').style.display = 'none';
+            document.getElementById('status').className = 'error';
+            document.getElementById('status').textContent = 'Screen sharing stopped';
+        }
+
+        // Initialize when page loads
+        document.addEventListener('DOMContentLoaded', () => {
+            getConnectionInfo();
+            initializeSocket();
+            
+            // Add event listeners for buttons
+            document.getElementById('startShare').addEventListener('click', async () => {
+                await startScreenShare();
+            });
+
+            document.getElementById('stopShare').addEventListener('click', () => {
+                stopScreenShare();
+            });
+        });
+    </script>
+</body>
+</html>
